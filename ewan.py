@@ -2,6 +2,7 @@ import requests
 import time
 import os
 import json
+import re
 from colorama import Fore, Style, init
 from rich.panel import Panel
 from rich.console import Console
@@ -98,39 +99,78 @@ def main_menu():
 # ============================================================================
 
 class FacebookPoster:
-    """Facebook post sharing class using Graph API"""
+    """Facebook post sharing class using Graph API - repost with original content"""
     def __init__(self, link, access_token):
         self.link = link
         self.access_token = access_token
+    
+    def extract_post_id(self, link):
+        """Extract post ID from Facebook URL"""
+        # Try to extract post ID from various Facebook URL formats
+        patterns = [
+            r'(\d+_\d+)',  # Standard format: userid_postid
+            r'story_fbid=(\d+)&id=(\d+)',  # Permalink format
+            r'fbid=(\d+)',
+            r'posts/(\d+)',
+            r'videos/(\d+)',
+        ]
+        
+        # Try standard format first (userid_postid)
+        match = re.search(r'(\d+_\d+)', link)
+        if match:
+            return match.group(1)
+        
+        # Try story_fbid format and construct post ID
+        match = re.search(r'story_fbid=(\d+)&id=(\d+)', link)
+        if match:
+            return f"{match.group(2)}_{match.group(1)}"
+        
+        # Try other patterns
+        for pattern in patterns[2:]:
+            match = re.search(pattern, link)
+            if match:
+                return match.group(1)
+        
+        return None
+
+    def get_post_details(self, post_id):
+        """Fetch original post details"""
+        try:
+            url = f"https://graph.facebook.com/v18.0/{post_id}"
+            params = {
+                'fields': 'message,full_picture,link,name,description',
+                'access_token': self.access_token
+            }
+            response = requests.get(url, params=params, timeout=30)
+            if response.status_code == 200:
+                return response.json()
+            return None
+        except:
+            return None
 
     def share_post(self):
-        """Shares a post on the user's feed with public visibility."""
-        url = "https://graph.facebook.com/me/feed"
+        """Shares a post by posting the link with Facebook's auto-generated preview"""
+        url = "https://graph.facebook.com/v18.0/me/feed"
         
-        # Build parameters for publicly visible shares
-        params = {
+        # Post the link - Facebook will automatically generate a preview card
+        post_data = {
             'link': self.link,
-            'published': '1',  # 1 = published (visible), 0 = unpublished (hidden)
-            'privacy': '{"value":"EVERYONE"}',  # PUBLIC visibility
-            'access_token': self.access_token
+            'access_token': self.access_token,
+            'privacy': json.dumps({'value': 'EVERYONE'})
         }
         
         headers = {
             'accept': '*/*',
-            'accept-encoding': 'gzip, deflate',
-            'connection': 'keep-alive',
-            'content-length': '0',
-            'host': 'graph.facebook.com'
+            'user-agent': 'Mozilla/5.0',
         }
         
         try:
-            response = requests.post(url, params=params, headers=headers, timeout=30)
+            response = requests.post(url, data=post_data, headers=headers, timeout=30)
             response_data = response.json()
             
             if response.status_code == 200 and 'id' in response_data:
                 return {'success': True, 'data': response_data}
             else:
-                # Get error message if available
                 error_msg = response_data.get('error', {}).get('message', f'HTTP {response.status_code}')
                 return {'success': False, 'error': error_msg}
         except requests.exceptions.RequestException as e:
@@ -388,6 +428,41 @@ def link_to_uid_converter():
 # BULK PROCESSORS (Cookie, AppState, C_USER, All Data)
 # ============================================================================
 
+def verify_token(access_token, retries=2):
+    """Verify if an access token is valid/live with retry logic"""
+    for attempt in range(retries):
+        try:
+            url = "https://graph.facebook.com/v18.0/me"
+            params = {
+                'access_token': access_token,
+                'fields': 'id,name'
+            }
+            response = requests.get(url, params=params, timeout=15)
+            data = response.json()
+            
+            if 'id' in data:
+                return {
+                    'live': True,
+                    'name': data.get('name', 'Unknown'),
+                    'user_id': data.get('id', 'Unknown')
+                }
+            elif 'error' in data:
+                # Token is genuinely invalid
+                error_msg = data.get('error', {}).get('message', 'Invalid token')
+                return {'live': False, 'is_dead': True, 'error': error_msg}
+            else:
+                return {'live': False, 'is_dead': True, 'error': 'Unknown error'}
+        except requests.exceptions.RequestException as e:
+            # Network/timeout error - retry if we have attempts left
+            if attempt < retries - 1:
+                time.sleep(1)
+                continue
+            return {'live': False, 'is_dead': False, 'error': f'Network error: {str(e)}'}
+        except Exception as e:
+            return {'live': False, 'is_dead': False, 'error': f'Verification error: {str(e)}'}
+    
+    return {'live': False, 'is_dead': False, 'error': 'Verification failed after retries'}
+
 def get_facebook_token(email, password):
     """Get Facebook access token and related data for a single account"""
     session = requests.Session()
@@ -434,13 +509,20 @@ def get_facebook_token(email, password):
                 } for c in cookies
             ]
             
+            # Verify token is live
+            verification = verify_token(token)
+            
             return {
                 'success': True,
                 'token': token,
                 'cookie': cookie_str,
                 'c_user': c_user,
                 'datr': datr,
-                'appstate': appstate
+                'appstate': appstate,
+                'live': verification['live'],
+                'is_dead': verification.get('is_dead', False),
+                'user_name': verification.get('name') if verification['live'] else None,
+                'user_id': verification.get('user_id') if verification['live'] else None
             }
         else:
             error_msg = data.get('error_msg', 'Login failed. Unknown error.')
@@ -488,6 +570,9 @@ def bulk_processor(mode):
     console.print(f"\n[yellow]Processing {len(accounts)} account(s)...[/yellow]\n")
     successful = 0
     failed = 0
+    live_accounts = 0
+    dead_accounts = 0
+    verification_errors = 0
     results = []
     
     for i, (uid, password) in enumerate(accounts, 1):
@@ -495,11 +580,25 @@ def bulk_processor(mode):
         result = get_facebook_token(uid, password)
         
         if result['success']:
-            print(f"{GREEN}✓{RESET}")
+            if result.get('live', False):
+                print(f"{GREEN}✓ LIVE ({result.get('user_name', 'Unknown')}){RESET}")
+                live_accounts += 1
+            elif result.get('is_dead', False):
+                print(f"{YELLOW}✓ DEAD (Token invalid){RESET}")
+                dead_accounts += 1
+            else:
+                print(f"{CYAN}✓ UNKNOWN (Verification error){RESET}")
+                verification_errors += 1
+            
             successful += 1
             results.append({
                 'uid': uid,
+                'password': password,
                 'status': 'success',
+                'live': result.get('live', False),
+                'is_dead': result.get('is_dead', False),
+                'user_name': result.get('user_name'),
+                'user_id': result.get('user_id'),
                 'token': result['token'],
                 'cookie': result['cookie'],
                 'c_user': result['c_user'],
@@ -510,14 +609,33 @@ def bulk_processor(mode):
             print(f"{RED}✗ {result['error']}{RESET}")
             failed += 1
     
-    console.print(f"\n[cyan]Total: {len(accounts)} | Success: {successful} | Failed: {failed}[/cyan]")
+    console.print(f"\n[bold cyan]{'='*65}[/bold cyan]")
+    console.print(f"[cyan]Total Processed: {len(accounts)}[/cyan]")
+    console.print(f"[green]✓ Live Accounts: {live_accounts}[/green]")
+    console.print(f"[yellow]⚠ Dead Accounts: {dead_accounts}[/yellow]")
+    if verification_errors > 0:
+        console.print(f"[cyan]? Verification Errors: {verification_errors}[/cyan]")
+    console.print(f"[red]✗ Login Failed: {failed}[/red]")
+    console.print(f"[bold cyan]{'='*65}[/bold cyan]\n")
     
     if successful > 0:
-        display_bulk_results(results, mode)
+        # Ask if user wants to see only live accounts
+        filter_choice = input("[cyan]Show only LIVE accounts? (y/n, default=n): [/cyan]").lower()
         
-        save_choice = input("\n[green]Save to file? (y/n): [/green]").lower()
-        if save_choice == 'y':
-            save_bulk_results(results, mode)
+        if filter_choice == 'y':
+            filtered_results = [r for r in results if r.get('live', False)]
+            console.print(f"[green]Filtered to {len(filtered_results)} live accounts[/green]\n")
+            display_bulk_results(filtered_results, mode)
+            
+            save_choice = input("\n[green]Save LIVE accounts to file? (y/n): [/green]").lower()
+            if save_choice == 'y':
+                save_bulk_results(filtered_results, mode, live_only=True)
+        else:
+            display_bulk_results(results, mode)
+            
+            save_choice = input("\n[green]Save ALL accounts to file? (y/n): [/green]").lower()
+            if save_choice == 'y':
+                save_bulk_results(results, mode, live_only=False)
     
     input("\n[bold yellow]Press Enter to return to the main menu...[/bold yellow]")
 
@@ -527,39 +645,81 @@ def display_bulk_results(results, mode):
     
     for result in results:
         if result['status'] == 'success':
+            # Build status indicator
+            if result.get('live', False):
+                user_name = result.get('user_name', 'Unknown')
+                status_indicator = f"[LIVE - {user_name}]"
+            elif result.get('is_dead', False):
+                status_indicator = "[DEAD]"
+            else:
+                status_indicator = "[VERIFICATION FAILED]"
+            
             if mode == 'cookie':
                 print(f"{result['cookie']}")
+                print(f"# {status_indicator}")
             elif mode == 'c_user':
                 print(f"{result['uid']}|{result['c_user']}")
+                print(f"# {status_indicator}")
             elif mode == 'appstate':
                 print(f"{json.dumps(result['appstate'])}")
+                print(f"# {status_indicator}")
             elif mode == 'all':
-                print(f"\nUID: {result['uid']}")
+                print(f"\n{'='*80}")
+                print(f"Status: {status_indicator}")
+                print(f"UID|Password: {result['uid']}|{result.get('password', 'N/A')}")
+                if result.get('user_name'):
+                    print(f"User Name: {result['user_name']}")
+                if result.get('user_id'):
+                    print(f"User ID: {result['user_id']}")
                 print(f"Token: {result['token']}")
                 print(f"Cookie: {result['cookie']}")
                 print(f"C_USER: {result['c_user']}")
                 print(f"AppState: {json.dumps(result['appstate'])}")
-                print("-" * 80)
+                print(f"{'='*80}")
     
     console.print(f"[cyan]═══════════════[/cyan]")
 
-def save_bulk_results(results, mode):
+def save_bulk_results(results, mode, live_only=False):
     """Save bulk processing results to file"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{mode}_{timestamp}.txt"
+    suffix = "_LIVE" if live_only else "_ALL"
+    filename = f"{mode}{suffix}_{timestamp}.txt"
+    
+    # Count each category properly
+    live_count = sum(1 for r in results if r.get('live', False))
+    dead_count = sum(1 for r in results if r.get('is_dead', False))
+    verification_errors = sum(1 for r in results if not r.get('live', False) and not r.get('is_dead', False))
     
     try:
         with open(filename, 'w') as f:
             f.write("=" * 80 + "\n")
             f.write(f"FACEBOOK {mode.upper()} Generator Results\n")
             f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Filter: {'LIVE ACCOUNTS ONLY' if live_only else 'ALL ACCOUNTS'}\n")
+            f.write(f"Total: {len(results)} | Live: {live_count} | Dead: {dead_count}")
+            if verification_errors > 0:
+                f.write(f" | Verification Errors: {verification_errors}")
+            f.write("\n")
             f.write("=" * 80 + "\n\n")
             
             for result in results:
                 if result['status'] == 'success':
+                    # Determine status based on live/is_dead flags
+                    if result.get('live', False):
+                        status = "LIVE"
+                    elif result.get('is_dead', False):
+                        status = "DEAD"
+                    else:
+                        status = "VERIFICATION FAILED"
+                    
                     f.write(f"\n{'='*80}\n")
-                    f.write(f"UID: {result['uid']}\n")
-                    f.write(f"Status: SUCCESS\n\n")
+                    f.write(f"Status: {status}\n")
+                    f.write(f"UID|Password: {result['uid']}|{result.get('password', 'N/A')}\n")
+                    if result.get('user_name'):
+                        f.write(f"User Name: {result['user_name']}\n")
+                    if result.get('user_id'):
+                        f.write(f"User ID: {result['user_id']}\n")
+                    f.write("\n")
                     
                     if mode in ['cookie', 'all']:
                         f.write(f"Cookie:\n{result['cookie']}\n\n")
@@ -567,7 +727,7 @@ def save_bulk_results(results, mode):
                         f.write(f"C_USER: {result['c_user']}\n")
                         f.write(f"DATR: {result['datr']}\n\n")
                     if mode in ['appstate', 'all']:
-                        f.write(f"AppState:\n{json.dumps(result['appstate'], indent=2)}\n")
+                        f.write(f"AppState:\n{json.dumps(result['appstate'], indent=2)}\n\n")
                     if mode == 'all':
                         f.write(f"Access Token:\n{result['token']}\n\n")
                     
